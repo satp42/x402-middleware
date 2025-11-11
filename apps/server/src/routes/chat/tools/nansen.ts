@@ -4,7 +4,9 @@ import {
   NansenUtils, 
   X402_CONSTANTS, 
   X402PaymentService,
+  DeferredPaymentService,
   type X402PaymentRequirement,
+  type DeferredPaymentRequirement,
   type GridTokenSender 
 } from '@darkresearch/mallory-shared';
 import { createGridClient } from '../../../lib/gridClient';
@@ -171,8 +173,41 @@ function createX402Service(x402Context?: X402Context): X402PaymentService | null
 }
 
 /**
+ * Initialize Deferred Payment Service with Grid context
+ */
+function createDeferredX402Service(x402Context?: X402Context): DeferredPaymentService | null {
+  if (!x402Context) {
+    return null;
+  }
+
+  const facilitatorUrl = process.env.FACILITATOR_URL || 'http://localhost:3001/api/facilitator';
+
+  return new DeferredPaymentService({
+    solanaRpcUrl: process.env.SOLANA_RPC_URL || process.env.EXPO_PUBLIC_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+    solanaCluster: 'mainnet-beta',
+    usdcMint: X402_CONSTANTS.USDC_MINT,
+    ephemeralFundingUsdc: X402_CONSTANTS.EPHEMERAL_FUNDING_USDC,
+    ephemeralFundingSol: X402_CONSTANTS.EPHEMERAL_FUNDING_SOL,
+    facilitatorConfig: {
+      url: facilitatorUrl,
+      settlementThresholds: {
+        amountThreshold: process.env.SETTLEMENT_THRESHOLD_AMOUNT || '1.00',
+        timeThreshold: parseInt(process.env.SETTLEMENT_THRESHOLD_TIME || '3600'),
+        countThreshold: parseInt(process.env.SETTLEMENT_THRESHOLD_COUNT || '100')
+      },
+      enableDisputes: process.env.ENABLE_DISPUTE_RESOLUTION === 'true',
+      autoSettlement: process.env.AUTO_SETTLEMENT !== 'false' // Default true
+    }
+  });
+}
+
+/**
  * Helper: Handle x402 payment server-side or return payment requirement
  * DRY helper used by all Nansen tools
+ * 
+ * Supports both immediate and deferred payment modes:
+ * - immediate: Pay upfront, fetch data (default, existing behavior)
+ * - deferred: Fetch data first, validate, queue for payment
  */
 async function handleX402OrReturnRequirement(
   x402Context: X402Context | undefined,
@@ -180,20 +215,91 @@ async function handleX402OrReturnRequirement(
 ): Promise<any> {
   // If Grid context available, handle payment server-side
   if (x402Context) {
-    console.log(`💰 [Nansen] Handling x402 payment server-side for ${paymentReq.toolName}...`);
+    const deferredEnabled = process.env.DEFERRED_PAYMENTS === 'true';
+    
+    // Create Grid sender with session context
+    const gridSender = createGridSender(
+      x402Context.gridSessionSecrets,
+      x402Context.gridSession.authentication,
+      x402Context.gridSession.address
+    );
+
+    // Check if deferred payment mode is enabled
+    if (deferredEnabled) {
+      console.log(`💳 [Nansen] Using deferred payment mode for ${paymentReq.toolName}...`);
+      
+      const deferredService = createDeferredX402Service(x402Context);
+      if (!deferredService) {
+        console.log('⚠️ [Nansen] Failed to initialize deferred service, falling back to immediate');
+        // Fall through to immediate payment
+      } else {
+        try {
+          // Convert to deferred payment requirement
+          const deferredReq: DeferredPaymentRequirement = {
+            ...paymentReq,
+            paymentMode: 'deferred',
+            validationRequired: true,
+            deferredTerms: {
+              maxRequests: parseInt(process.env.DEFERRED_MAX_REQUESTS || '100'),
+              maxAmount: process.env.DEFERRED_MAX_AMOUNT || '1.00',
+              settlementPeriod: parseInt(process.env.SETTLEMENT_THRESHOLD_TIME || '3600') / 3600, // hours
+              currency: 'USDC'
+            }
+          };
+
+          // Fetch data with temporary credit
+          const { data, authorization } = await deferredService.fetchWithCredit(
+            deferredReq,
+            x402Context.gridSession.address,
+            gridSender
+          );
+
+          // Validate data quality
+          const isValid = await deferredService.validateDataQuality(data, deferredReq);
+          
+          if (!isValid) {
+            console.error('❌ [Nansen] Data validation failed');
+            // Create dispute
+            try {
+              const facilitatorUrl = process.env.FACILITATOR_URL || 'http://localhost:3001/api/facilitator';
+              await fetch(`${facilitatorUrl}/dispute`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  authorizationId: authorization.id,
+                  agentAddress: x402Context.gridSession.address,
+                  reason: 'Data quality validation failed',
+                  evidence: {
+                    validationErrors: ['Empty or invalid data received']
+                  }
+                })
+              });
+            } catch (disputeError) {
+              console.error('⚠️ [Nansen] Failed to create dispute:', disputeError);
+            }
+            throw new Error('Data quality validation failed');
+          }
+
+          // Queue for settlement
+          await deferredService.queueForSettlement(authorization);
+
+          console.log(`✅ [Nansen] Data fetched via deferred payment for ${paymentReq.toolName}`);
+          return data;
+        } catch (error) {
+          console.error('❌ [Nansen] Deferred payment failed:', error);
+          console.log('⚠️ [Nansen] Falling back to immediate payment');
+          // Fall through to immediate payment as fallback
+        }
+      }
+    }
+
+    // Immediate payment mode (default/fallback)
+    console.log(`💰 [Nansen] Using immediate payment mode for ${paymentReq.toolName}...`);
     
     const x402Service = createX402Service(x402Context);
     if (!x402Service) {
       throw new Error('Failed to initialize x402 service');
     }
-
-    // Create Grid sender with session context
-    // gridSession now has structure: { authentication: [...], address: "..." }
-    const gridSender = createGridSender(
-      x402Context.gridSessionSecrets,
-      x402Context.gridSession.authentication,  // Pass authentication array to Grid SDK
-      x402Context.gridSession.address
-    );
 
     // Execute x402 payment and fetch data
     const data = await x402Service.payAndFetchData(
@@ -202,7 +308,7 @@ async function handleX402OrReturnRequirement(
       gridSender
     );
 
-    console.log(`✅ [Nansen] Data fetched via x402 for ${paymentReq.toolName}`);
+    console.log(`✅ [Nansen] Data fetched via immediate payment for ${paymentReq.toolName}`);
     return data;
   }
 

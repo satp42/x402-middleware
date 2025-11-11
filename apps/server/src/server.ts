@@ -5,7 +5,8 @@ import { chatRouter } from './routes/chat/index.js';
 import { holdingsRouter } from './routes/wallet/holdings.js';
 import gridRouter from './routes/grid.js';
 import authRouter from './routes/auth.js';
-import { readFileSync } from 'fs';
+import facilitatorRouter from './routes/facilitator.js';
+import { readFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -95,6 +96,7 @@ app.use('/api/chat', chatRouter);
 app.use('/api/wallet/holdings', holdingsRouter);
 app.use('/api/grid', gridRouter);
 app.use('/api/auth', authRouter);
+app.use('/api/facilitator', facilitatorRouter);
 
 // 404 handler
 app.use((req, res) => {
@@ -117,10 +119,18 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 async function checkOpenMemory() {
   const openMemoryUrl = process.env.OPENMEMORY_URL;
   const openMemoryApiKey = process.env.OPENMEMORY_API_KEY;
+  const openMemoryBackendDir = join(process.cwd(), 'services/openmemory/backend');
   
   if (!openMemoryUrl || !openMemoryApiKey) {
     console.log('⚠️  OpenMemory: Not configured (OPENMEMORY_URL or OPENMEMORY_API_KEY missing)');
     console.log('   Infinite memory will be disabled. Add to .env to enable.');
+    return;
+  }
+
+  if (!existsSync(openMemoryBackendDir)) {
+    console.log('⚠️  OpenMemory: Backend not installed (services/openmemory/backend missing)');
+    console.log('   Run: bun ./services/openmemory-setup.sh');
+    console.log('   This will download and configure the OpenMemory service locally.');
     return;
   }
 
@@ -139,9 +149,9 @@ async function checkOpenMemory() {
       console.log(`   Check that OpenMemory is running on ${openMemoryUrl}`);
     }
   } catch (error) {
-    console.log(`❌ OpenMemory: Connection failed (${openMemoryUrl})`);
-    console.log(`   Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    console.log(`   Run: cd services/openmemory/backend && bun start`);
+    console.log(`⚠️  OpenMemory: Not running (${openMemoryUrl})`);
+    console.log(`   Infinite memory disabled (optional feature)`);
+    // Uncomment to enable: ./services/openmemory-setup.sh
   }
 }
 
@@ -161,6 +171,7 @@ app.listen(PORT, async () => {
   console.log(`   POST /api/grid/init-account - Grid init (CORS proxy)`);
   console.log(`   POST /api/grid/verify-otp - Grid OTP verify (CORS proxy)`);
   console.log(`   POST /api/grid/send-tokens - Grid token transfer (CORS proxy)`);
+  console.log(`   POST /api/facilitator/* - Deferred payment facilitator`);
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('');
   

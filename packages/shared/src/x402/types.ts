@@ -11,6 +11,84 @@ export interface X402PaymentRequirement {
   };
 }
 
+// Deferred payment types
+export type PaymentMode = 'immediate' | 'deferred' | 'aggregated';
+export type AuthorizationStatus = 'pending' | 'validated' | 'settled' | 'disputed' | 'expired';
+
+export interface DeferredTerms {
+  maxRequests: number;
+  maxAmount: string;
+  settlementPeriod: number; // hours
+  escrowAmount?: string;
+  currency: string;
+}
+
+export interface DeferredPaymentRequirement extends X402PaymentRequirement {
+  paymentMode: PaymentMode;
+  deferredTerms?: DeferredTerms;
+  validationRequired?: boolean;
+}
+
+export interface PaymentAuthorization {
+  id: string;
+  agentAddress: string;
+  merchantAddress: string;
+  toolName: string;
+  amount: string;
+  currency: string;
+  timestamp: number;
+  expiresAt: number;
+  signature: string;
+  nonce: string;
+  status: AuthorizationStatus;
+  dataHash?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface SettlementBatch {
+  id: string;
+  agentAddress: string;
+  merchantAddress: string;
+  authorizations: PaymentAuthorization[];
+  totalAmount: string;
+  currency: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  createdAt: number;
+  settledAt?: number;
+  transactionSignature?: string;
+  error?: string;
+}
+
+export interface DisputeRecord {
+  id: string;
+  authorizationId: string;
+  agentAddress: string;
+  merchantAddress: string;
+  reason: string;
+  status: 'pending' | 'investigating' | 'resolved' | 'rejected';
+  createdAt: number;
+  resolvedAt?: number;
+  resolution?: string;
+  evidence?: {
+    dataHash?: string;
+    validationErrors?: string[];
+    additionalInfo?: Record<string, any>;
+  };
+}
+
+export interface SettlementThreshold {
+  amountThreshold: string; // e.g., "1.00" USDC
+  timeThreshold: number; // seconds
+  countThreshold: number; // number of requests
+}
+
+export interface FacilitatorConfig {
+  url: string;
+  settlementThresholds: SettlementThreshold;
+  enableDisputes: boolean;
+  autoSettlement: boolean;
+}
+
 export interface NansenHistoricalBalancesRequest {
   address: string;
   chain: string;

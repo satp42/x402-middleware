@@ -41,3 +41,4 @@ core
 
 # OpenMemory (installed via setup script, not committed)
 services/openmemory/
+.cursor/rules/openmemory.mdc
