@@ -1,0 +1,643 @@
+import { View, Text, TextInput, StyleSheet, Platform, useWindowDimensions, TouchableOpacity, Pressable, ActivityIndicator } from 'react-native';
+import { useRouter, useLocalSearchParams } from 'expo-router';
+import { useState, useEffect, useRef } from 'react';
+import Animated, { 
+  useSharedValue, 
+  useAnimatedStyle, 
+  withTiming, 
+  withDelay,
+  Easing 
+} from 'react-native-reanimated';
+import { LAYOUT, storage, SECURE_STORAGE_KEYS } from '@/lib';
+import { PressableButton } from '@/components/ui/PressableButton';
+import { useAuth } from '@/contexts/AuthContext';
+import { useGrid } from '@/contexts/GridContext';
+import { gridClientService } from '@/features/grid';
+
+/**
+ * OTP Verification Screen
+ * 
+ * Matches the login screen design exactly:
+ * - Same orange background (#E67B25)
+ * - Same Mallory lockup (centered on web, left-aligned on mobile)
+ * - Same button style at bottom
+ * - Simple, focused, no modals
+ * 
+ * State Management:
+ * - This screen is SELF-CONTAINED - manages its own workflow state
+ * - OTP session loaded from secure storage on mount (set by initiateGridSignIn)
+ * - OTP session updated locally on resend (writes to storage for persistence)
+ * - Does NOT rely on GridContext for OTP session state
+ * - Email passed via route params
+ */
+export default function VerifyOtpScreen() {
+  const router = useRouter();
+  const params = useLocalSearchParams<{ 
+    email: string;
+    backgroundColor?: string;
+    textColor?: string;
+    returnPath?: string;
+  }>();
+  const { width } = useWindowDimensions();
+  const { logout } = useAuth();
+  const { completeGridSignIn } = useGrid();  // Only need the action, not the data
+  
+  // Mobile detection
+  const isMobile = Platform.OS === 'ios' || Platform.OS === 'android' || width < 768;
+  
+  // Dynamic background color (defaults to orange for login flow)
+  const bgColor = params.backgroundColor || '#E67B25';
+  // Dynamic text color (defaults to white for login flow)
+  const textColor = params.textColor || '#FFFFFF';
+
+  // State
+  const [otp, setOtp] = useState('');
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [error, setError] = useState('');
+  
+  // Local OTP session state - this screen owns this data
+  // Loaded from secure storage on mount, updated on resend
+  const [otpSession, setOtpSession] = useState<any>(null);
+  
+  // Guard to prevent double-submission
+  const verificationInProgress = useRef(false);
+  
+  // Ref for the hidden input to manage focus
+  const inputRef = useRef<TextInput>(null);
+
+  // Handle OTP input with number validation
+  const handleOtpChange = (text: string) => {
+    // Only allow numbers
+    const numericOnly = text.replace(/[^0-9]/g, '');
+    setOtp(numericOnly);
+  };
+
+  // Animation values
+  const textOpacity = useSharedValue(0);
+  const textTranslateY = useSharedValue(20);
+  const buttonsOpacity = useSharedValue(0);
+  const buttonsTranslateY = useSharedValue(20);
+
+  // Animation for cursor blink
+  const cursorOpacity = useSharedValue(1);
+  
+  useEffect(() => {
+    // Blink cursor
+    const blinkCursor = () => {
+      cursorOpacity.value = withTiming(0, { duration: 500 }, () => {
+        cursorOpacity.value = withTiming(1, { duration: 500 });
+      });
+    };
+    
+    const interval = setInterval(blinkCursor, 1000);
+    return () => clearInterval(interval);
+  }, []);
+  
+  const cursorAnimatedStyle = useAnimatedStyle(() => ({
+    opacity: cursorOpacity.value,
+  }));
+
+  // Trigger entrance animations on mount
+  useEffect(() => {
+    const fadeInConfig = {
+      duration: 1200,
+      easing: Easing.out(Easing.cubic),
+    };
+
+    textOpacity.value = withTiming(1, fadeInConfig);
+    textTranslateY.value = withTiming(0, fadeInConfig);
+    buttonsOpacity.value = withDelay(200, withTiming(1, fadeInConfig));
+    buttonsTranslateY.value = withDelay(200, withTiming(0, fadeInConfig));
+  }, []);
+
+  // Fix background color for web - use dynamic color
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+
+    const originalHtmlBg = document.documentElement.style.backgroundColor;
+    const originalBodyBg = document.body.style.backgroundColor;
+
+    document.documentElement.style.backgroundColor = bgColor;
+    document.body.style.backgroundColor = bgColor;
+
+    return () => {
+      document.documentElement.style.backgroundColor = originalHtmlBg;
+      document.body.style.backgroundColor = originalBodyBg;
+    };
+  }, [bgColor]);
+
+  // Load OTP session from secure storage on mount
+  // This is workflow state that belongs to this screen - not app state
+  useEffect(() => {
+    const loadOtpSession = async () => {
+      try {
+        const stored = await storage.persistent.getItem(SECURE_STORAGE_KEYS.GRID_OTP_SESSION);
+        
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          setOtpSession(parsed);
+          console.log('✅ [OTP Screen] Loaded OTP session from secure storage');
+        } else {
+          // CRITICAL: If no OTP session exists, user shouldn't be on this screen
+          // This indicates a routing error (navigated here without going through sign-in flow)
+          console.error('❌ [OTP Screen] CRITICAL: No OTP session found - invalid navigation');
+          setError('Session error. Please sign in again.');
+          // Could also redirect back to login here
+        }
+      } catch (err) {
+        console.error('❌ [OTP Screen] Failed to load OTP session:', err);
+        setError('Session error. Please sign in again.');
+      }
+    };
+    
+    loadOtpSession();
+  }, []); // Only run on mount
+
+  // Animated styles
+  const textAnimatedStyle = useAnimatedStyle(() => ({
+    opacity: textOpacity.value,
+    transform: [{ translateY: textTranslateY.value }],
+  }));
+
+  const buttonsAnimatedStyle = useAnimatedStyle(() => ({
+    opacity: buttonsOpacity.value,
+    transform: [{ translateY: buttonsTranslateY.value }],
+  }));
+
+  const handleVerify = async () => {
+    // Guard against double-submission
+    if (verificationInProgress.current) {
+      console.log('⚠️  [OTP Screen] Verification already in progress');
+      return;
+    }
+
+    // Validate OTP
+    const cleanOtp = otp.trim();
+    if (cleanOtp.length !== 6) {
+      setError('Code must be exactly 6 digits');
+      return;
+    }
+
+    if (!/^\d{6}$/.test(cleanOtp)) {
+      setError('Code must contain only numbers');
+      return;
+    }
+
+    // Check OTP session
+    if (!otpSession) {
+      setError('Session error. Please try signing in again.');
+      return;
+    }
+
+    // Set guards
+    verificationInProgress.current = true;
+    setIsVerifying(true);
+    setError('');
+
+    try {
+      console.log('🔐 [OTP Screen] Verifying OTP via GridContext...');
+      
+      // Use GridContext to complete sign-in (it handles navigation)
+      await completeGridSignIn(otpSession, cleanOtp);
+      
+      console.log('✅ [OTP Screen] Verification successful!');
+    } catch (err: any) {
+      console.error('❌ [OTP Screen] Verification error:', err);
+      const errorMessage = err instanceof Error ? err.message : 'Verification failed';
+      
+      // Parse error messages and guide user to resend if needed
+      if (errorMessage.toLowerCase().includes('invalid email and code combination')) {
+        setError('Invalid code. The code may have expired. Please resend code.');
+      } else if (errorMessage.toLowerCase().includes('invalid code') || 
+                 errorMessage.toLowerCase().includes('expired') ||
+                 errorMessage.toLowerCase().includes('used')) {
+        setError('This code is invalid or has expired. Please resend code.');
+      } else {
+        setError(errorMessage);
+      }
+    } finally {
+      setIsVerifying(false);
+      verificationInProgress.current = false;
+    }
+  };
+
+  const handleResendCode = async () => {
+    setIsVerifying(true);
+    setError('');
+    setOtp('');
+
+    try {
+      console.log('🔄 [OTP Screen] Resending OTP - starting new sign-in flow...');
+      
+      // Start sign-in again to get new OTP (Grid sends new email)
+      const { otpSession: newOtpSession } = await gridClientService.startSignIn(params.email);
+      
+      // Update LOCAL state with new OTP session
+      setOtpSession(newOtpSession);
+      
+      // Also update secure storage for persistence (e.g., if user refreshes page)
+      await storage.persistent.setItem(SECURE_STORAGE_KEYS.GRID_OTP_SESSION, JSON.stringify(newOtpSession));
+      
+      console.log('✅ [OTP Screen] New OTP sent successfully');
+    } catch (err) {
+      console.error('❌ [OTP Screen] Failed to resend:', err);
+      setError(err instanceof Error ? err.message : 'Failed to resend code');
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  // Button disabled logic
+  const isButtonDisabled = () => {
+    if (error) {
+      return isVerifying; // Allow "Resend Code" unless currently resending
+    }
+    const cleanOtp = otp.trim();
+    return isVerifying || cleanOtp.length !== 6;
+  };
+
+  const getButtonText = () => {
+    if (isVerifying) {
+      return 'Verifying...';
+    } else if (error) {
+      return 'Resend Code';
+    } else {
+      return 'Continue';
+    }
+  };
+
+  const getButtonStyle = () => {
+    // Active state: 6 digits entered, no error, not verifying
+    const isActive = otp.length === 6 && !error && !isVerifying;
+    
+    return {
+      backgroundColor: isActive ? 'rgb(251, 251, 251)' : '#FBAA69',
+    };
+  };
+
+  const getButtonTextStyle = () => {
+    // Active state: 6 digits entered, no error, not verifying
+    const isActive = otp.length === 6 && !error && !isVerifying;
+    
+    return {
+      color: isActive ? '#212121' : '#1F1F1F',
+    };
+  };
+
+  const handleButtonPress = () => {
+    if (error) {
+      handleResendCode();
+    } else {
+      handleVerify();
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      // Clear OTP session from secure storage
+      await storage.persistent.removeItem(SECURE_STORAGE_KEYS.GRID_OTP_SESSION);
+      await logout();
+    } catch (err) {
+      console.error('Sign out error:', err);
+    }
+  };
+
+  // Focus the hidden input when clicking anywhere on the OTP area
+  const focusInput = () => {
+    inputRef.current?.focus();
+  };
+
+  return (
+    <Pressable 
+      style={{ flex: 1 }}
+      onPress={focusInput}
+    >
+      <View 
+        style={[
+          styles.container,
+          { backgroundColor: bgColor },
+          Platform.OS === 'web' && {
+            height: '100dvh' as any,
+            maxHeight: '100dvh' as any,
+          }
+        ]}
+      >
+      {/* Mobile header with sign out */}
+      {isMobile && (
+        <View style={styles.mobileHeader}>
+          <TouchableOpacity onPress={handleSignOut} style={styles.signOutButtonMobile}>
+            <Text style={[styles.signOutText, { color: textColor }]}>Sign Out</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      <View style={[styles.content, isMobile && styles.contentMobile]}>
+        {/* Top group - OTP + Instruction Text (like lockup + tagline on login) */}
+        <Animated.View style={[textAnimatedStyle, isMobile && { width: '100%', flex: 1, justifyContent: 'center' }]}>
+          {/* OTP Input - 6 underscores style */}
+          <Pressable onPress={focusInput}>
+            <View style={[
+              styles.otpContainer,
+              isMobile && { marginBottom: 11 } // Match lockup-to-tagline spacing on mobile
+            ]}>
+              {[0, 1, 2, 3, 4, 5].map((index) => {
+                const isActive = index === otp.length && !isVerifying;
+                return (
+                  <View 
+                    key={index} 
+                    style={[
+                      styles.digitBox,
+                      isMobile && styles.digitBoxMobile
+                    ]}
+                  >
+                    <Text style={[styles.digitText, { color: textColor }]}>
+                      {otp[index] || ''}
+                    </Text>
+                    {/* Show cursor on active position */}
+                    {isActive && (
+                      <Animated.View style={[styles.cursor, { backgroundColor: textColor }, cursorAnimatedStyle]} />
+                    )}
+                    <View style={[
+                      styles.digitUnderline,
+                      { backgroundColor: textColor, opacity: 0.3 }
+                    ]} />
+                  </View>
+                );
+              })}
+            </View>
+          </Pressable>
+          
+          {/* Hidden TextInput for capturing input */}
+          <TextInput
+            ref={inputRef}
+            style={styles.hiddenInput}
+            value={otp}
+            onChangeText={handleOtpChange}
+            keyboardType="number-pad"
+            maxLength={6}
+            autoFocus
+            editable={!isVerifying}
+            onSubmitEditing={() => {
+              // Submit on Enter key
+              if (otp.trim().length === 6 && !isVerifying && !error) {
+                handleVerify();
+              }
+            }}
+            returnKeyType="done"
+            blurOnSubmit={false}
+          />
+
+          {/* Instruction Text - grouped with OTP like tagline with lockup */}
+          <Text style={[styles.instruction, isMobile && styles.instructionMobile, { color: textColor, opacity: 0.8 }]}>
+            {isVerifying 
+              ? 'Verifying your code...'
+              : `We've sent a 6-digit code to ${params.email}`
+            }
+          </Text>
+          
+          {/* Error only - no hint */}
+          {error && (
+            <Text style={[styles.error, { color: textColor, opacity: 0.9 }]}>{error}</Text>
+          )}
+        </Animated.View>
+
+        {/* Bottom section - Button */}
+        <Animated.View style={[isMobile && styles.bottomSectionMobile, buttonsAnimatedStyle]}>
+          <View style={[styles.buttonSection, isMobile && styles.buttonSectionMobile]}>
+            <PressableButton
+              fullWidth={isMobile}
+              onPress={handleButtonPress}
+              loading={isVerifying}
+              disabled={isButtonDisabled()}
+              style={{
+                ...(isMobile ? styles.buttonMobile : styles.button),
+                ...getButtonStyle()
+              }}
+              textStyle={getButtonTextStyle()}
+            >
+              {getButtonText()}
+            </PressableButton>
+          </View>
+        </Animated.View>
+      </View>
+
+      {/* Web footer with centered sign out */}
+        {!isMobile && (
+          <View style={styles.webFooter}>
+            <TouchableOpacity onPress={handleSignOut} style={styles.signOutButtonWeb}>
+              <Text style={[styles.signOutText, { color: textColor }]}>Sign Out</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </View>
+
+      {/* Full-screen loading overlay when verifying */}
+      {isVerifying && (
+        <View style={styles.loadingOverlay}>
+          <View style={styles.loadingContent}>
+            <ActivityIndicator size="large" color="#FFFFFF" />
+            <Text style={styles.loadingText}>Verifying your code...</Text>
+          </View>
+        </View>
+      )}
+    </Pressable>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    // backgroundColor now set dynamically via inline style
+  },
+  content: {
+    flex: 1,
+    justifyContent: 'center', // Centered on web (like login)
+    alignItems: 'center',
+    paddingHorizontal: 32,
+    maxWidth: LAYOUT.AUTH_MAX_WIDTH,
+    width: '100%',
+    alignSelf: 'center',
+  },
+  contentMobile: {
+    justifyContent: 'space-between', // Space between top group and button on mobile
+    alignItems: 'stretch',
+    paddingHorizontal: 24,
+    paddingTop: 80,
+  },
+  
+  // Main section - OTP at top
+  mainSectionMobile: {
+    flex: 1,
+    justifyContent: 'center',
+  },
+  
+  // OTP Container - 6 digit boxes
+  otpContainer: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 16,
+    marginBottom: 24, // Match lockup-to-tagline spacing on web
+    marginLeft: -8, // Move 8px to the left
+  },
+  
+  digitBox: {
+    width: 48,
+    height: 60,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingBottom: 4, // 4px padding between number and underscore
+  },
+  
+  digitBoxMobile: {
+    paddingBottom: 3, // Reduced by 1/3 on mobile (4px - 1.33px ≈ 3px)
+  },
+  
+  digitText: {
+    fontSize: 52, // Big and bold
+    color: '#FFEFE3',
+    fontFamily: 'Belwe-Medium', // Mallory special font
+    textAlign: 'center',
+  },
+  
+  cursor: {
+    position: 'absolute',
+    bottom: 14, // Adjusted for 4px padding
+    left: '50%',
+    marginLeft: -1,
+    width: 2,
+    height: 28,
+    backgroundColor: '#FFEFE3',
+    borderRadius: 1,
+  },
+  
+  digitUnderline: {
+    position: 'absolute',
+    bottom: 4, // Adjusted for 4px padding
+    left: 0,
+    right: 0,
+    height: 2,
+    backgroundColor: '#F8CEAC',
+    borderRadius: 1,
+    opacity: 0.5,
+  },
+  
+  // Hidden input (captures keyboard input)
+  hiddenInput: {
+    position: 'absolute',
+    opacity: 0,
+    height: 1,
+    width: 1,
+  },
+  
+  // Instruction text
+  instruction: {
+    fontSize: 16,
+    color: '#F8CEAC',
+    fontFamily: 'Satoshi',
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  instructionMobile: {
+    textAlign: 'left', // Left-aligned on mobile like login screen
+  },
+  
+  // Error
+  error: {
+    color: '#FF3B30',
+    fontSize: 14,
+    textAlign: 'center',
+    marginTop: 8,
+    fontFamily: 'Satoshi',
+  },
+  
+  // Bottom section
+  bottomSectionMobile: {
+    width: '100%',
+    paddingBottom: 24,
+  },
+  
+  // Button Section
+  buttonSection: {
+    width: '100%',
+    alignItems: 'center',
+  },
+  buttonSectionMobile: {
+    alignItems: 'stretch',
+  },
+  
+  // Button
+  button: {
+    backgroundColor: '#FBAA69',
+    borderRadius: 28,
+    paddingVertical: 14,
+    paddingHorizontal: 28,
+    minWidth: 250,
+    maxWidth: 345,
+  },
+  buttonMobile: {
+    width: '100%',
+    minWidth: 0,
+    paddingVertical: 16,
+  },
+  
+  // Mobile Header
+  mobileHeader: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    left: 0,
+    paddingTop: 16, // Closer to top
+    paddingRight: 24,
+    paddingLeft: 24,
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    zIndex: 10,
+  },
+  
+  // Sign Out Buttons
+  signOutButtonMobile: {
+    padding: 8,
+  },
+  signOutButtonWeb: {
+    padding: 12,
+  },
+  signOutText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontFamily: 'Satoshi',
+    opacity: 0.8,
+  },
+  
+  // Web Footer
+  webFooter: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    paddingVertical: 24,
+    paddingBottom: 32,
+    zIndex: 10,
+  },
+  
+  // Loading Overlay
+  loadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 999,
+  },
+  loadingContent: {
+    alignItems: 'center',
+    gap: 16,
+  },
+  loadingText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontFamily: 'Satoshi',
+    fontWeight: '500',
+  },
+});
+
