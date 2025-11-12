@@ -14,7 +14,7 @@ interface StreamConfigOptions {
   tools: any;
   strategy: {
     useExtendedThinking: boolean;
-    useInfiniteMemory: boolean;
+    useMem0: boolean;
   };
 }
 

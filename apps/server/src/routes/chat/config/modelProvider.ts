@@ -1,17 +1,15 @@
 /**
- * Model provider setup with Infinite Memory
+ * Model provider setup with mem0
  * 
- * Infinite Memory handles context retrieval:
- * - Semantic retrieval via OpenMemory
- * - Smart hybrid strategy (recent + relevant)
- * - Token-aware budget management
- * 
- * Storage happens explicitly after messages are saved to Supabase
+ * mem0 handles context retrieval via REST API:
+ * - Semantic search via mem0's hosted platform
+ * - Conversation-level memory scoping
+ * - Automatic deduplication and updates
  */
 
-import { createInfiniteMemory } from 'infinite-memory';
+import { anthropic } from '@ai-sdk/anthropic';
 import type { UIMessage } from 'ai';
-import { estimateTotalTokens } from '../../../lib/contextWindow';
+import { estimateTotalTokens } from '../../../lib/contextWindow.js';
 import { v4 as uuidv4 } from 'uuid';
 
 interface ModelProviderResult {
@@ -19,50 +17,188 @@ interface ModelProviderResult {
   processedMessages: UIMessage[];
   strategy: {
     useExtendedThinking: boolean;
-    useInfiniteMemory: boolean;
+    useMem0: boolean;
     estimatedTokens: number;
     reason: string;
   };
 }
 
-// Initialize Infinite Memory provider once at module level
-let infiniteMemory: ReturnType<typeof createInfiniteMemory> | null = null;
+// mem0 Platform API Base URL
+const MEM0_API_BASE = 'https://api.mem0.ai/v1';
 
-export async function getInfiniteMemory(): Promise<ReturnType<typeof createInfiniteMemory>> {
-  if (!infiniteMemory) {
-    const openMemoryUrl = process.env.OPENMEMORY_URL || 'http://localhost:8080';
-    const openMemoryApiKey = process.env.OPENMEMORY_API_KEY;
-    const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+/**
+ * mem0 Platform REST API client
+ */
+class Mem0PlatformClient {
+  private apiKey: string;
+  private baseUrl: string;
 
-    if (!openMemoryApiKey) {
+  constructor(apiKey: string, baseUrl: string = MEM0_API_BASE) {
+    this.apiKey = apiKey;
+    this.baseUrl = baseUrl;
+  }
+
+  private async request(endpoint: string, options: RequestInit = {}): Promise<any> {
+    const url = `${this.baseUrl}${endpoint}`;
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        'Authorization': `Token ${this.apiKey}`,
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`mem0 API error (${response.status}): ${errorText}`);
+    }
+
+    return response.json();
+  }
+
+  async add(messages: string | any[], userId: string, metadata: Record<string, any> = {}): Promise<any> {
+    return this.request('/memories/', {
+      method: 'POST',
+      body: JSON.stringify({
+        messages: typeof messages === 'string' ? messages : messages,
+        user_id: userId,
+        metadata,
+      }),
+    });
+  }
+
+  async search(query: string, userId: string, options: { limit?: number } = {}): Promise<any> {
+    const params = new URLSearchParams({
+      query,
+      user_id: userId,
+      limit: (options.limit || 10).toString(),
+    });
+
+    return this.request(`/memories/search/?${params.toString()}`);
+  }
+}
+
+// Initialize mem0 Platform client once at module level
+let mem0Client: Mem0PlatformClient | null = null;
+
+export async function getMem0Client(): Promise<Mem0PlatformClient> {
+  if (!mem0Client) {
+    const mem0ApiKey = process.env.OPENMEMORY_API_KEY;
+
+    if (!mem0ApiKey) {
       throw new Error('OPENMEMORY_API_KEY is required but not configured');
     }
 
-    if (!anthropicApiKey) {
-      throw new Error('ANTHROPIC_API_KEY is required but not configured');
-    }
-
-    infiniteMemory = createInfiniteMemory({
-      openMemoryUrl,
-      openMemoryApiKey,
-      anthropicApiKey,
-      openMemoryTimeout: 2000, // 2 second timeout for localhost
-    });
-
-    console.log('✨ [InfiniteMemory] Provider initialized');
+    mem0Client = new Mem0PlatformClient(mem0ApiKey);
+    console.log('✨ [mem0] Platform client initialized');
   }
 
-  return infiniteMemory;
+  return mem0Client;
 }
 
 /**
- * Setup model provider with Infinite Memory
+ * Store a message to mem0
  * 
- * Gets relevant context from OpenMemory and returns Anthropic model
+ * @param conversationId - Conversation ID (used as userId for conversation-level scoping)
+ * @param userId - Actual user ID (stored in metadata)
+ * @param role - Message role (user or assistant)
+ * @param message - Message object or content string
+ * @param messageId - Message ID
+ */
+export async function storeMessage(
+  conversationId: string,
+  userId: string,
+  role: 'user' | 'assistant',
+  message: any,
+  messageId: string
+): Promise<void> {
+  const memory = await getMem0Client();
+  
+  // Extract text content from message
+  let content = '';
+  if (typeof message === 'string') {
+    content = message;
+  } else if (message.content) {
+    content = message.content;
+  } else if (message.parts && Array.isArray(message.parts)) {
+    // Extract text from parts array
+    content = message.parts
+      .filter((part: any) => part.type === 'text')
+      .map((part: any) => part.text)
+      .join('\n');
+  }
+
+  if (!content || content.trim().length === 0) {
+    console.warn(`⚠️ [mem0] Skipping empty message: ${messageId}`);
+    return;
+  }
+
+  try {
+    // Format as message array for mem0
+    const messages = [
+      {
+        role,
+        content
+      }
+    ];
+
+    // Store using conversationId as userId for conversation-level scoping
+    // Actual userId and other metadata stored for reference
+    await memory.add(messages, conversationId, {
+      role,
+      message_id: messageId,
+      actual_user_id: userId,
+      conversation_id: conversationId,
+      created_at: new Date().toISOString()
+    });
+    
+    console.log(`✅ [mem0] Stored ${role} message: ${messageId}`);
+  } catch (error) {
+    console.error(`❌ [mem0] Failed to store ${role} message:`, error);
+    // Don't throw - continue even if memory storage fails
+  }
+}
+
+/**
+ * Search for relevant context from mem0
+ * 
+ * @param conversationId - Conversation ID (used as userId for scoping)
+ * @param query - Search query
+ * @param limit - Maximum number of results
+ * @returns Array of relevant memories
+ */
+async function searchContext(
+  conversationId: string,
+  query: string,
+  limit: number = 10
+): Promise<any[]> {
+  const memory = await getMem0Client();
+  
+  try {
+    // Search using conversationId as userId for conversation-level scoping
+    const response = await memory.search(query, conversationId, { limit });
+    
+    if (response && response.results && Array.isArray(response.results)) {
+      console.log(`📝 [mem0] Found ${response.results.length} relevant memories`);
+      return response.results;
+    }
+    
+    return [];
+  } catch (error) {
+    console.error('❌ [mem0] Search failed:', error);
+    return [];
+  }
+}
+
+/**
+ * Setup model provider with mem0
+ * 
+ * Gets relevant context from mem0 and returns Anthropic model
  * 
  * @param messages - Full conversation history (from client)
  * @param conversationId - Conversation ID for memory scoping
- * @param userId - User ID for memory scoping
+ * @param userId - User ID for reference
  * @param claudeModel - Claude model to use
  * @returns Model instance and context-enriched messages
  */
@@ -74,78 +210,86 @@ export async function setupModelProvider(
 ): Promise<ModelProviderResult> {
   const estimatedTokens = estimateTotalTokens(messages);
   
-  console.log(`🧠 [InfiniteMemory] Full conversation: ${messages.length} messages, ${estimatedTokens.toLocaleString()} tokens`);
+  console.log(`🧠 [mem0] Full conversation: ${messages.length} messages, ${estimatedTokens.toLocaleString()} tokens`);
   
-  // Get or create the infinite memory provider
-  const memory = await getInfiniteMemory();
+  // Extract last user message for search query
+  const userMessages = messages.filter(msg => msg.role === 'user');
+  const lastUserMessage = userMessages[userMessages.length - 1];
   
-  // Get relevant context from OpenMemory
-  // This retrieves recent + semantically relevant messages
-  const contextResult = await memory.getRelevantContext(
-    conversationId,
-    userId,
-    messages as any,
-    claudeModel
-  );
-  
-  console.log(`📝 [InfiniteMemory] Context: ${contextResult.messages.length} messages${contextResult.historicalContext ? ' + historical context' : ''}`);
-  console.log(`📊 [InfiniteMemory] Source: ${contextResult.metadata.usedOpenMemory ? 'OpenMemory' : 'Fallback (recent only)'}`);
-  
-  // Get the Anthropic model
-  const model = memory.getModel(claudeModel);
-  
-  // Convert CoreMessages back to UIMessages (preserve parts structure)
-  let uiMessages = contextResult.messages.map((msg: any) => {
-    // If message already has parts array (from client), preserve it
-    if (msg.parts) {
-      return msg;
+  let searchQuery = '';
+  if (lastUserMessage) {
+    const msg = lastUserMessage as any;
+    if (typeof msg.content === 'string') {
+      searchQuery = msg.content;
+    } else if (msg.parts && Array.isArray(msg.parts)) {
+      searchQuery = msg.parts
+        .filter((part: any) => part.type === 'text')
+        .map((part: any) => part.text)
+        .join(' ');
     }
-    
-    // Otherwise convert content to parts format
-    const content = msg.content;
-    if (typeof content === 'string') {
-      return {
-        role: msg.role,
-        parts: [{ type: 'text', text: content }],
-      };
-    } else if (Array.isArray(content)) {
-      // Content is already a parts array
-      return {
-        role: msg.role,
-        parts: content,
-      };
-    }
-    
-    return msg;
-  });
-
-  // Inject historical context as a system message before the recent messages
-  if (contextResult.historicalContext) {
-    const contextMessage: UIMessage = {
-      id: uuidv4(),
-      role: 'user',
-      parts: [{
-        type: 'text',
-        text: `[CONTEXT FROM PAST CONVERSATIONS]\n${contextResult.historicalContext}\n\n[END CONTEXT - Continue with current conversation]`,
-      }],
-    };
-    
-    // Insert context before the first recent message
-    uiMessages = [contextMessage, ...uiMessages];
-    
-    console.log('📝 [InfiniteMemory] Injected historical context as system message');
   }
+
+  let contextMessages = messages;
+  let retrievedCount = 0;
+  let usedMem0 = false;
+
+  // Search for relevant context if we have a query
+  if (searchQuery && searchQuery.trim().length > 0) {
+    try {
+      const relevantMemories = await searchContext(conversationId, searchQuery, 10);
+      
+      if (relevantMemories.length > 0) {
+        usedMem0 = true;
+        retrievedCount = relevantMemories.length;
+        
+        // Build historical context from retrieved memories
+        const historicalContext = relevantMemories
+          .map((mem: any, idx: number) => {
+            const score = mem.score ? ` (relevance: ${mem.score.toFixed(2)})` : '';
+            return `${idx + 1}. ${mem.memory}${score}`;
+          })
+          .join('\n\n');
+        
+        // Inject as context before the recent messages
+        const contextMessage: UIMessage = {
+          id: uuidv4(),
+          role: 'user',
+          parts: [{
+            type: 'text',
+            text: `[CONTEXT FROM PAST MESSAGES IN THIS CONVERSATION]\n${historicalContext}\n\n[END CONTEXT - Continue with current conversation]`,
+          }],
+        };
+        
+        // Keep only recent messages to save tokens (last 10)
+        const recentCount = Math.min(10, messages.length);
+        const recentMessages = messages.slice(-recentCount);
+        
+        contextMessages = [contextMessage, ...recentMessages];
+        
+        console.log(`📝 [mem0] Injected ${retrievedCount} memories as context, keeping ${recentCount} recent messages`);
+      }
+    } catch (error) {
+      console.error('❌ [mem0] Failed to retrieve context:', error);
+      // Continue with original messages on error
+    }
+  }
+
+  const finalEstimatedTokens = estimateTotalTokens(contextMessages);
+  console.log(`📊 [mem0] Final message count: ${contextMessages.length}, estimated tokens: ${finalEstimatedTokens.toLocaleString()}`);
+
+  // Get the Anthropic model
+  const model = anthropic(claudeModel);
 
   return {
     model,
-    processedMessages: uiMessages as UIMessage[],
+    processedMessages: contextMessages,
     strategy: {
       useExtendedThinking: false,
-      useInfiniteMemory: true,
-      estimatedTokens: contextResult.metadata.estimatedTokens,
-      reason: contextResult.metadata.usedOpenMemory 
-        ? `Infinite Memory: ${contextResult.metadata.retrievedCount} memories + ${contextResult.metadata.recentCount} recent` 
-        : 'Infinite Memory: fallback to recent messages'
+      useMem0: usedMem0,
+      estimatedTokens: finalEstimatedTokens,
+      reason: usedMem0 
+        ? `mem0: ${retrievedCount} memories + ${contextMessages.length - 1} recent` 
+        : 'mem0: no relevant memories found, using recent messages'
     }
   };
 }

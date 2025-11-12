@@ -6,9 +6,6 @@ import { holdingsRouter } from './routes/wallet/holdings.js';
 import gridRouter from './routes/grid.js';
 import authRouter from './routes/auth.js';
 import facilitatorRouter from './routes/facilitator.js';
-import { readFileSync, existsSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
 
 // Load environment variables
 dotenv.config();
@@ -115,43 +112,21 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
   });
 });
 
-// Check OpenMemory connection
-async function checkOpenMemory() {
-  const openMemoryUrl = process.env.OPENMEMORY_URL;
-  const openMemoryApiKey = process.env.OPENMEMORY_API_KEY;
-  const openMemoryBackendDir = join(process.cwd(), 'services/openmemory/backend');
+// Check mem0 configuration
+function checkMem0Config() {
+  const mem0ApiKey = process.env.OPENMEMORY_API_KEY;
   
-  if (!openMemoryUrl || !openMemoryApiKey) {
-    console.log('⚠️  OpenMemory: Not configured (OPENMEMORY_URL or OPENMEMORY_API_KEY missing)');
-    console.log('   Infinite memory will be disabled. Add to .env to enable.');
+  if (!mem0ApiKey) {
+    console.log('⚠️  mem0: Not configured (OPENMEMORY_API_KEY missing)');
+    console.log('   Conversation memory will be disabled. Add to .env to enable.');
     return;
   }
 
-  if (!existsSync(openMemoryBackendDir)) {
-    console.log('⚠️  OpenMemory: Backend not installed (services/openmemory/backend missing)');
-    console.log('   Run: bun ./services/openmemory-setup.sh');
-    console.log('   This will download and configure the OpenMemory service locally.');
-    return;
-  }
-
-  try {
-    // Try to ping OpenMemory health endpoint
-    const response = await fetch(`${openMemoryUrl}/health`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(2000), // 2 second timeout
-    });
-
-    if (response.ok) {
-      console.log(`✅ OpenMemory: Connected (${openMemoryUrl})`);
-      console.log(`   Infinite memory enabled with semantic retrieval`);
-    } else {
-      console.log(`⚠️  OpenMemory: Unreachable (HTTP ${response.status})`);
-      console.log(`   Check that OpenMemory is running on ${openMemoryUrl}`);
-    }
-  } catch (error) {
-    console.log(`⚠️  OpenMemory: Not running (${openMemoryUrl})`);
-    console.log(`   Infinite memory disabled (optional feature)`);
-    // Uncomment to enable: ./services/openmemory-setup.sh
+  if (mem0ApiKey.startsWith('m0-')) {
+    console.log('✅ mem0: Configured (hosted platform)');
+    console.log('   Conversation memory enabled with semantic search');
+  } else {
+    console.log('⚠️  mem0: API key format unexpected (should start with "m0-")');
   }
 }
 
@@ -175,21 +150,8 @@ app.listen(PORT, async () => {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('');
   
-  // Log infinite-memory version
-  try {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = dirname(__filename);
-    const infiniteMemoryPkgPath = join(__dirname, '../node_modules/infinite-memory/package.json');
-    const infiniteMemoryPkg = JSON.parse(readFileSync(infiniteMemoryPkgPath, 'utf-8'));
-    console.log(`📦 infinite-memory version: ${infiniteMemoryPkg.version}`);
-    console.log('');
-  } catch (error) {
-    console.log('⚠️  Could not read infinite-memory version');
-    console.log('');
-  }
-  
-  // Check OpenMemory connection
-  await checkOpenMemory();
+  // Check mem0 configuration
+  checkMem0Config();
   console.log('');
 });
 

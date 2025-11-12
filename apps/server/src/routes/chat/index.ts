@@ -139,7 +139,7 @@ router.post('/', authenticateUser, async (req: AuthenticatedRequest, res) => {
       console.log('💾 Saving user message immediately:', lastUserMessage.id);
       const result = await saveUserMessage(conversationId, lastUserMessage);
       if (result.success && result.messageId) {
-        // Store the whole message object for OpenMemory (preserves all parts)
+        // Store the whole message object for mem0 (preserves all parts)
         userMessageData = { messageId: result.messageId, message: lastUserMessage };
       }
     }
@@ -159,7 +159,7 @@ router.post('/', authenticateUser, async (req: AuthenticatedRequest, res) => {
     }
 
     // Setup model provider with smart strategy
-    // This retrieves relevant context from OpenMemory
+    // This retrieves relevant context from mem0
     const { model, processedMessages, strategy } = await setupModelProvider(
       conversationMessages,
       conversationId,
@@ -167,23 +167,22 @@ router.post('/', authenticateUser, async (req: AuthenticatedRequest, res) => {
       getClaudeModel()
     );
 
-    // After getting context, store the current user message to OpenMemory
+    // After getting context, store the current user message to mem0
     // (Do this AFTER context retrieval so the current message isn't included in search)
     if (userMessageData.messageId && userMessageData.message) {
       try {
-        const { getInfiniteMemory } = await import('./config/modelProvider.js');
-        const memory = await getInfiniteMemory();
+        const { storeMessage } = await import('./config/modelProvider.js');
         // Store entire message object (preserves parts array with all content types)
-        await memory.storeMessage(
+        await storeMessage(
           conversationId,
           userId,
           'user',
           userMessageData.message,
           userMessageData.messageId
         );
-        console.log('✅ [InfiniteMemory] Stored user message:', userMessageData.messageId);
+        console.log('✅ [mem0] Stored user message:', userMessageData.messageId);
       } catch (error) {
-        console.error('❌ [InfiniteMemory] Failed to store user message:', error);
+        console.error('❌ [mem0] Failed to store user message:', error);
       }
     }
 
@@ -220,7 +219,7 @@ router.post('/', authenticateUser, async (req: AuthenticatedRequest, res) => {
       nansenTokenJupiterDcas: toolRegistry.createNansenTokenJupiterDcasTool(x402Context),
       nansenPnlLeaderboard: toolRegistry.createNansenPnlLeaderboardTool(x402Context),
       nansenPortfolio: toolRegistry.createNansenPortfolioTool(x402Context),
-      // Memory now handled by infinite-memory package (automatic)
+      // Memory now handled by mem0 (automatic context retrieval and storage)
     };
 
     // Log model configuration with actual enabled tools
